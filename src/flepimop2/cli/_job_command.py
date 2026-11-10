@@ -33,7 +33,7 @@ from flepimop2.cli._process_command import ProcessCommand
 from flepimop2.cli._register_command import register_command
 from flepimop2.cli._simulate_command import SimulateCommand
 from flepimop2.configuration import ConfigurationModel
-from flepimop2.job.abc import JobDryRun, JobHandle
+from flepimop2.job.abc import PARALLEL, JobDryRun, JobHandle
 from flepimop2.job.abc import build as build_job
 
 
@@ -131,7 +131,13 @@ def _dispatch_to_job(inner: CliCommand, job_kwargs: dict[str, Any]) -> None:
 
     plan: Mapping[str, Any] | None = None
     result: JobHandle | JobDryRun | dict[str, JobHandle]
-    if isinstance(inner, ProcessCommand) and job.supports_plan:
+    if job.execution == PARALLEL and not job.supports_plan:
+        raise ValueError(
+            f"Job backend '{job.module}' does not support parallel execution."
+        )
+    if (isinstance(inner, ProcessCommand)
+            and job.supports_plan
+            and job.execution == PARALLEL):
         plan = inner.build_plan()
         result = job.submit_plan(plan, dry_run=dry_run)
     else:

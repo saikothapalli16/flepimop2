@@ -27,7 +27,8 @@ __all__ = [
 from abc import abstractmethod
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, ClassVar
+import enum
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
@@ -133,7 +134,8 @@ class JobDryRun(BaseModel):
     command: str
     details: dict[str, str] = Field(default_factory=dict)
 
-
+SERIAL = "serial"
+PARALLEL = "parallel"
 class JobABC(ModuleBase, module_namespace="job"):
     """Abstract base class for flepimop2 job runners.
 
@@ -145,7 +147,9 @@ class JobABC(ModuleBase, module_namespace="job"):
     """
 
     # Plan submission is optional so existing submit-only backends remain valid.
+    # Default execution is serial.
     supports_plan: ClassVar[bool] = False
+    execution: Literal["serial", "parallel"] = SERIAL
 
     def submit(
         self, command: "CliCommand", *, dry_run: bool = False
