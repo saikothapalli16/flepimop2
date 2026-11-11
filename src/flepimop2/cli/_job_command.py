@@ -33,8 +33,9 @@ from flepimop2.cli._process_command import ProcessCommand
 from flepimop2.cli._register_command import register_command
 from flepimop2.cli._simulate_command import SimulateCommand
 from flepimop2.configuration import ConfigurationModel
-from flepimop2.job.abc import PARALLEL, JobDryRun, JobHandle
+from flepimop2.job.abc import PARALLEL, JobABC, JobDryRun, JobHandle
 from flepimop2.job.abc import build as build_job
+from flepimop2.process._plan import ProcessPlan
 
 
 @click.group(name="job")
@@ -100,6 +101,39 @@ def _validate_plan_result(
     return validated
 
 
+def _submit_job(
+    job: JobABC,
+    inner: CliCommand,
+    *,
+    dry_run: bool,
+) -> tuple[
+    JobHandle | JobDryRun | dict[str, JobHandle],
+    ProcessPlan | None,
+]:
+    """Submit a command using the configured execution mode.
+
+    Returns:
+        A tuple containing the submission result and the process plan,
+        if one was created.
+
+    Raises:
+        ClickException: If parallel execution is requested for a backend
+            that does not support process plans.
+    """
+    if isinstance(inner, ProcessCommand) and job.execution == PARALLEL:
+        if not job.supports_plan:
+            msg = (
+                f"Job backend '{job.module}' does not support "
+                "parallel process execution."
+            )
+            raise click.ClickException(msg)
+
+        plan = inner.build_plan()
+        return job.submit_plan(plan, dry_run=dry_run), plan
+
+    return job.submit(inner, dry_run=dry_run), None
+
+
 def _dispatch_to_job(inner: CliCommand, job_kwargs: dict[str, Any]) -> None:
     verbosity: int = int(inner.bound_kwargs.get("verbosity", 0))
     logger = get_script_logger(__name__, verbosity)
@@ -131,17 +165,7 @@ def _dispatch_to_job(inner: CliCommand, job_kwargs: dict[str, Any]) -> None:
 
     plan: Mapping[str, Any] | None = None
     result: JobHandle | JobDryRun | dict[str, JobHandle]
-    if job.execution == PARALLEL and not job.supports_plan:
-        raise ValueError(
-            f"Job backend '{job.module}' does not support parallel execution."
-        )
-    if (isinstance(inner, ProcessCommand)
-            and job.supports_plan
-            and job.execution == PARALLEL):
-        plan = inner.build_plan()
-        result = job.submit_plan(plan, dry_run=dry_run)
-    else:
-        result = job.submit(inner, dry_run=dry_run)
+    result, plan = _submit_job(job, inner, dry_run=dry_run)
 
     # Handle submission results
     if isinstance(result, JobDryRun):

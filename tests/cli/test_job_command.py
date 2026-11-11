@@ -20,8 +20,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import click
 import pytest
 from click.testing import CliRunner
+from pydantic import ValidationError
 
 from flepimop2.cli._job_command import (
     _dispatch_to_job,
@@ -30,7 +32,8 @@ from flepimop2.cli._job_command import (
 )
 from flepimop2.cli._process_command import ProcessCommand
 from flepimop2.cli._simulate_command import SimulateCommand
-from flepimop2.job.abc import JobDryRun, JobHandle
+from flepimop2.job.abc import PARALLEL, SERIAL, JobDryRun, JobHandle
+from flepimop2.job.shell import ShellJob
 
 
 def test_validate_plan_result_returns_job_handles() -> None:
@@ -39,6 +42,12 @@ def test_validate_plan_result_returns_job_handles() -> None:
     plan: dict[str, object] = {"step1": {}}
 
     assert _validate_plan_result({"step1": handle}, plan) == {"step1": handle}
+
+
+def test_validate_plan_result_rejects_missing_plan() -> None:
+    """A mapping result without a submitted plan is invalid."""
+    with pytest.raises(TypeError, match="requires a process plan"):
+        _validate_plan_result({"step1": JobHandle(job_id="1", backend="test")}, None)
 
 
 def test_validate_plan_result_rejects_non_string_step_name() -> None:
@@ -100,6 +109,7 @@ def test_process_dispatches_plan_to_capable_backend(
     }
     mock_job = MagicMock()
     mock_job.supports_plan = True
+    mock_job.execution = PARALLEL
     mock_job.submit_plan.return_value = {"step1": JobHandle(job_id="1", backend="test")}
 
     with (
@@ -140,23 +150,22 @@ process:
     command = ProcessCommand(config=config_path, target="step1", dry_run=False)
     mock_job = MagicMock()
     mock_job.supports_plan = True
-    mock_job.submit_plan.return_value = JobDryRun(command="planned")
+    mock_job.execution = PARALLEL
+    expected_plan = {
+        "step1": {
+            "command": ["flepimop2", "process", "--target", "step1"],
+            "depends": [],
+        }
+    }
+    # A plan submission returns one handle per step.
+    mock_job.submit_plan.return_value = {"step1": JobHandle(job_id="1", backend="test")}
 
     with (
         patch(
             "flepimop2.cli._job_command.build_job",
             return_value=mock_job,
         ) as build_job,
-        patch.object(
-            command,
-            "build_plan",
-            return_value={
-                "step1": {
-                    "command": ["flepimop2", "process", "--target", "step1"],
-                    "depends": [],
-                }
-            },
-        ),
+        patch.object(command, "build_plan", return_value=expected_plan),
         pytest.raises(SystemExit) as excinfo,
     ):
         _dispatch_to_job(
@@ -167,10 +176,7 @@ process:
     assert excinfo.value.code == 0
     selected_backend = build_job.call_args.args[0]
     assert selected_backend.module == "shell"
-    mock_job.submit_plan.assert_called_once_with(
-        mock_job.submit_plan.call_args.args[0],
-        dry_run=False,
-    )
+    mock_job.submit_plan.assert_called_once_with(expected_plan, dry_run=False)
 
 
 def test_process_plan_dispatch_forwards_dry_run_without_caching(
@@ -189,6 +195,7 @@ def test_process_plan_dispatch_forwards_dry_run_without_caching(
     }
     mock_job = MagicMock()
     mock_job.supports_plan = True
+    mock_job.execution = PARALLEL
     mock_job.submit_plan.return_value = JobDryRun(command="planned")
 
     with (
@@ -221,6 +228,7 @@ def test_process_dispatches_command_to_submit_only_backend(
     command = ProcessCommand(config=config_path, target="step1", dry_run=False)
     mock_job = MagicMock()
     mock_job.supports_plan = False
+    mock_job.execution = SERIAL
     mock_job.submit.return_value = JobHandle(job_id="1", backend="test")
 
     with (
@@ -238,6 +246,121 @@ def test_process_dispatches_command_to_submit_only_backend(
     assert excinfo.value.code == 0
     mock_job.submit.assert_called_once_with(command, dry_run=False)
     mock_job.submit_plan.assert_not_called()
+
+
+def test_process_serial_uses_submit_even_when_backend_supports_plans(
+    tmp_path: Path,
+) -> None:
+    """Serial mode preserves single-command submission for plan-capable backends."""
+    config_path = tmp_path / "config.yaml"
+    _make_minimal_config(config_path)
+    command = ProcessCommand(config=config_path, target="step1", dry_run=False)
+
+    mock_job = MagicMock()
+    mock_job.execution = SERIAL
+    mock_job.supports_plan = True
+    mock_job.submit.return_value = JobHandle(job_id="1", backend="test")
+
+    with (
+        patch("flepimop2.cli._job_command.ConfigurationModel.from_yaml") as mock_load,
+        patch(
+            "flepimop2.cli._job_command._get_config_target",
+            return_value={"module": "test"},
+        ),
+        patch("flepimop2.cli._job_command.build_job", return_value=mock_job),
+        patch.object(command, "build_plan") as build_plan,
+    ):
+        mock_load.return_value.jobs = {"local": {"module": "test"}}
+        with pytest.raises(SystemExit) as excinfo:
+            _dispatch_to_job(command, {"job_target": "local", "no_cache": True})
+
+    assert excinfo.value.code == 0
+    mock_job.submit.assert_called_once_with(command, dry_run=False)
+    mock_job.submit_plan.assert_not_called()
+    build_plan.assert_not_called()
+
+
+def test_process_parallel_rejects_backend_without_plan_support(
+    tmp_path: Path,
+) -> None:
+    """Parallel mode fails before submitting when the backend lacks plan support."""
+    config_path = tmp_path / "config.yaml"
+    _make_minimal_config(config_path)
+    command = ProcessCommand(config=config_path, target="step1", dry_run=False)
+
+    mock_job = MagicMock()
+    mock_job.module = "test"
+    mock_job.execution = PARALLEL
+    mock_job.supports_plan = False
+
+    with (
+        patch("flepimop2.cli._job_command.ConfigurationModel.from_yaml") as mock_load,
+        patch(
+            "flepimop2.cli._job_command._get_config_target",
+            return_value={"module": "test"},
+        ),
+        patch("flepimop2.cli._job_command.build_job", return_value=mock_job),
+        patch.object(command, "build_plan") as build_plan,
+    ):
+        mock_load.return_value.jobs = {"local": {"module": "test"}}
+        with pytest.raises(
+            click.ClickException,
+            match="does not support parallel process execution",
+        ):
+            _dispatch_to_job(command, {"job_target": "local", "no_cache": True})
+
+    mock_job.submit.assert_not_called()
+    mock_job.submit_plan.assert_not_called()
+    build_plan.assert_not_called()
+
+
+@pytest.mark.parametrize("supports_plan", [False, True])
+def test_simulate_parallel_configuration_uses_submit(
+    tmp_path: Path,
+    *,
+    supports_plan: bool,
+) -> None:
+    """Simulation submission is unaffected by process-plan execution mode."""
+    config_path = tmp_path / "config.yaml"
+    _make_minimal_config(config_path)
+    command = SimulateCommand(config=config_path, dry_run=False)
+
+    mock_job = MagicMock()
+    mock_job.execution = PARALLEL
+    mock_job.supports_plan = supports_plan
+    mock_job.submit.return_value = JobHandle(job_id="1", backend="test")
+
+    with (
+        patch("flepimop2.cli._job_command.ConfigurationModel.from_yaml") as mock_load,
+        patch(
+            "flepimop2.cli._job_command._get_config_target",
+            return_value={"module": "test"},
+        ),
+        patch("flepimop2.cli._job_command.build_job", return_value=mock_job),
+    ):
+        mock_load.return_value.jobs = {"local": {"module": "test"}}
+        with pytest.raises(SystemExit) as excinfo:
+            _dispatch_to_job(command, {"job_target": "local", "no_cache": True})
+
+    assert excinfo.value.code == 0
+    mock_job.submit.assert_called_once_with(command, dry_run=False)
+    mock_job.submit_plan.assert_not_called()
+
+
+def test_job_execution_defaults_to_serial() -> None:
+    """Job backends use serial submission unless configured otherwise."""
+    assert ShellJob().execution == SERIAL
+
+
+def test_job_execution_accepts_parallel_configuration() -> None:
+    """Pydantic accepts the supported parallel execution mode."""
+    assert ShellJob.model_validate({"execution": PARALLEL}).execution == PARALLEL
+
+
+def test_job_execution_rejects_invalid_configuration() -> None:
+    """Pydantic rejects unsupported execution modes during backend creation."""
+    with pytest.raises(ValidationError, match="execution"):
+        ShellJob.model_validate({"execution": "distributed"})
 
 
 @pytest.fixture(autouse=True)
@@ -273,6 +396,7 @@ def test_job_simulate_dispatches_to_job_backend(tmp_path: Path) -> None:
         submitted_at=datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC),
     )
     mock_job = MagicMock()
+    mock_job.execution = SERIAL
     mock_job.submit.return_value = mock_handle
 
     runner = CliRunner()
@@ -301,6 +425,7 @@ def test_job_simulate_dry_run_reports_and_does_not_cache(
     _make_minimal_config(config_path)
 
     mock_job = MagicMock()
+    mock_job.execution = SERIAL
     mock_job.submit.return_value = JobDryRun(
         command="flepimop2 simulate config.yaml --dry-run",
         details={"mode": "blocking"},
@@ -334,6 +459,7 @@ def test_job_simulate_inner_command_not_executed_locally(tmp_path: Path) -> None
     _make_minimal_config(config_path)
 
     mock_job = MagicMock()
+    mock_job.execution = SERIAL
     mock_job.submit.return_value = JobHandle(
         job_id="1",
         backend="shell",
@@ -372,6 +498,7 @@ def test_job_simulate_passes_inner_command_to_submit(tmp_path: Path) -> None:
         return mock_handle
 
     mock_job = MagicMock()
+    mock_job.execution = SERIAL
     mock_job.submit.side_effect = capture_submit
 
     runner = CliRunner()
@@ -399,6 +526,7 @@ def test_job_simulate_submits_and_produces_handle(tmp_path: Path) -> None:
         submitted_at=datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC),
     )
     mock_job = MagicMock()
+    mock_job.execution = SERIAL
     mock_job.submit.return_value = handle
 
     runner = CliRunner()
@@ -424,6 +552,7 @@ def test_job_target_option_selects_named_job(tmp_path: Path) -> None:
     _make_minimal_config(config_path, job_name="cluster")
 
     mock_job = MagicMock()
+    mock_job.execution = SERIAL
     mock_job.submit.return_value = JobHandle(
         job_id="1",
         backend="shell",

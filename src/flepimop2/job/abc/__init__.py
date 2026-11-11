@@ -27,7 +27,6 @@ __all__ = [
 from abc import abstractmethod
 from datetime import UTC, datetime
 from enum import StrEnum
-import enum
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
@@ -134,16 +133,24 @@ class JobDryRun(BaseModel):
     command: str
     details: dict[str, str] = Field(default_factory=dict)
 
-SERIAL = "serial"
-PARALLEL = "parallel"
+
+SERIAL: Literal["serial"] = "serial"
+PARALLEL: Literal["parallel"] = "parallel"
+
+
 class JobABC(ModuleBase, module_namespace="job"):
     """Abstract base class for flepimop2 job runners.
 
     Backends support ordinary command submission through :meth:`submit`.
-    Backends that can submit dependency-aware process plans should set
+    Backends that support dependency-aware process plans should set
     ``supports_plan`` to ``True`` and implement :meth:`_submit_plan`.
-    Submit-only backends leave ``supports_plan`` as ``False`` and only need to
-    implement :meth:`_submit`.
+
+    The ``execution`` field controls how process commands are submitted:
+    ``serial`` (default) submits the complete process command as a single
+    job, while ``parallel`` submits individual process steps using
+    :meth:`submit_plan`.
+
+    Parallel process execution requires ``supports_plan = True``.
     """
 
     # Plan submission is optional so existing submit-only backends remain valid.
