@@ -28,6 +28,7 @@ from threading import current_thread, main_thread
 from time import monotonic, sleep
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self
 
+import click
 from pydantic import Field, PrivateAttr, model_validator
 
 from flepimop2.exceptions import ValidationIssue
@@ -219,6 +220,11 @@ class ShellJob(JobABC, module="shell"):
         pending = commands.copy()
         running: dict[str, subprocess.Popen[bytes]] = {}
         completed: dict[str, JobHandle] = {}
+        start_time = monotonic()
+        click.echo(
+            f"Starting {len(pending)} parallel process steps "
+            f"(max_workers={self.max_workers})"
+        )
 
         # Python signal handlers can only be installed by the main thread.
         handle_sigterm = current_thread() is main_thread()
@@ -227,13 +233,18 @@ class ShellJob(JobABC, module="shell"):
 
         try:
             while pending or running:
-                self._advance_plan(plan, pending, running, completed)
+                self._advance_plan(
+                    plan, pending, running, completed, start_time=start_time
+                )
         except BaseException:
             _stop_process_groups(running)
             raise
         finally:
             if handle_sigterm:
                 signal.signal(signal.SIGTERM, previous_sigterm)
+            click.echo(
+                f"Total parallel execution time: {monotonic() - start_time:.2f}s"
+            )
 
         return {step: completed[step] for step in ordered_steps}
 
@@ -279,12 +290,15 @@ class ShellJob(JobABC, module="shell"):
     def _collect_completed(
         running: dict[str, subprocess.Popen[bytes]],
         completed: dict[str, JobHandle],
+        *,
+        start_time: float | None = None,
     ) -> bool:
         """Collect completed subprocesses and detect execution failures.
 
         Args:
             running: Currently running subprocesses keyed by step name.
             completed: Successfully completed job handles.
+            start_time: Optional monotonic timestamp when parallel execution began.
 
         Returns:
             True if at least one subprocess completed, otherwise False.
@@ -293,12 +307,20 @@ class ShellJob(JobABC, module="shell"):
             RuntimeError: If a subprocess exits with a nonzero return code.
         """
         progressed = False
+        if start_time is None:
+            start_time = monotonic()
 
         for step, proc in list(running.items()):
             returncode = proc.poll()
 
             if returncode is None:
                 continue
+
+            click.echo(
+                f"[{monotonic() - start_time:.2f}s] "
+                f"END {step} (PID={proc.pid}, exit={returncode})",
+                err=returncode != 0,
+            )
 
             if returncode != 0:
                 msg = f"Process step '{step}' failed with exit code {returncode}."
@@ -325,6 +347,8 @@ class ShellJob(JobABC, module="shell"):
         pending: dict[str, list[str]],
         running: dict[str, subprocess.Popen[bytes]],
         completed: dict[str, JobHandle],
+        *,
+        start_time: float | None = None,
     ) -> bool:
         """Launch process steps whose dependencies have completed.
 
@@ -333,11 +357,14 @@ class ShellJob(JobABC, module="shell"):
             pending: Commands waiting to execute.
             running: Currently running subprocesses.
             completed: Successfully completed job handles.
+            start_time: Optional monotonic timestamp when parallel execution began.
 
         Returns:
             True if at least one subprocess was launched, otherwise False.
         """
         launched = False
+        if start_time is None:
+            start_time = monotonic()
 
         for step, argv in list(pending.items()):
             if len(running) >= self.max_workers:
@@ -355,6 +382,9 @@ class ShellJob(JobABC, module="shell"):
                     start_new_session=True,
                 )
                 running[step] = proc
+            click.echo(
+                f"[{monotonic() - start_time:.2f}s] START {step} (PID={proc.pid})"
+            )
             del pending[step]
             launched = True
 
@@ -366,6 +396,8 @@ class ShellJob(JobABC, module="shell"):
         pending: dict[str, list[str]],
         running: dict[str, subprocess.Popen[bytes]],
         completed: dict[str, JobHandle],
+        *,
+        start_time: float | None = None,
     ) -> None:
         """Advance execution by collecting results and launching ready steps.
 
@@ -374,13 +406,17 @@ class ShellJob(JobABC, module="shell"):
             pending: Commands waiting to execute.
             running: Currently running subprocesses.
             completed: Successfully completed job handles.
+            start_time: Optional monotonic timestamp when parallel execution began.
 
         Raises:
             RuntimeError: If remaining process steps cannot progress.
         """
-        progressed = self._collect_completed(running, completed)
+        progressed = self._collect_completed(running, completed, start_time=start_time)
 
-        progressed = self._launch_ready(plan, pending, running, completed) or progressed
+        progressed = (
+            self._launch_ready(plan, pending, running, completed, start_time=start_time)
+            or progressed
+        )
 
         if pending and not running:
             msg = f"Process plan cannot progress. Remaining steps: {sorted(pending)}"
