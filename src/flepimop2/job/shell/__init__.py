@@ -20,23 +20,32 @@ __all__ = ["ShellJob"]
 import os
 import shlex
 import shutil
+import signal
 import subprocess  # noqa: S404
+from contextlib import suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from threading import current_thread, main_thread
+from time import monotonic, sleep
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self
 
-from pydantic import PrivateAttr
+from pydantic import Field, PrivateAttr, model_validator
 
 from flepimop2.exceptions import ValidationIssue
 from flepimop2.job.abc import (
+    SERIAL,
     JobABC,
     JobDryRun,
     JobHandle,
     JobStatus,
     JobStatusResult,
 )
+from flepimop2.process._plan import ProcessPlan
+from flepimop2.process.abc import resolve_plan
 from flepimop2.typing import override
 
 if TYPE_CHECKING:
+    from types import FrameType
+
     from flepimop2.cli import CliCommand
 
 
@@ -54,11 +63,36 @@ class ShellJob(JobABC, module="shell"):
             until the subprocess exits (useful for tests).
     """
 
+    # shell jobs support plans if parallel is configured in yaml
+    supports_plan: ClassVar[bool] = True
+    # default execution is serial
+    execution: Literal["serial", "parallel"] = SERIAL
+    # default max workers is 4
+    max_workers: int = Field(default=4, ge=1)
+
     cwd: Path | None = None
     env: dict[str, str] | None = None
     detach: bool = True
 
     _exe: str | None = PrivateAttr(default=None)
+
+    @model_validator(mode="after")
+    def _validate_parallel_detach(self) -> Self:
+        """Require blocking execution for parallel shell jobs.
+
+        Returns:
+            The validated ShellJob instance.
+
+        Raises:
+            ValueError: If parallel execution explicitly enables detachment.
+        """
+        if self.execution == "parallel":
+            if "detach" not in self.model_fields_set:
+                self.detach = False
+            elif self.detach:
+                msg = "Parallel ShellJob execution requires detach=False."
+                raise ValueError(msg)
+        return self
 
     @override
     def _submit_validate(self) -> list[ValidationIssue]:
@@ -128,6 +162,231 @@ class ShellJob(JobABC, module="shell"):
             metadata = {"mode": "blocking", "returncode": result.returncode}
         return JobHandle(job_id=job_id, backend="shell", metadata=metadata)
 
+    @override
+    def _submit_plan(
+        self,
+        plan: ProcessPlan,
+        *,
+        dry_run: bool = False,
+    ) -> dict[str, JobHandle] | JobDryRun:
+        """Execute independent process steps concurrently.
+
+        Validate the dependency graph before execution. Run eligible
+        steps concurrently, respecting dependencies and max_workers.
+
+        Parallel execution is blocking so that dependencies and process
+        failures can be monitored.
+
+        Args:
+            plan: Process steps with commands and dependencies.
+            dry_run: If True, describe execution without launching processes.
+
+        Returns:
+            Completed job handles keyed by step, or a dry-run description.
+
+        Raises:
+            ValueError: If detached parallel execution is requested.
+            NotImplementedError: If the platform does not support POSIX processes.
+        """
+        if self.detach:
+            msg = "Parallel ShellJob execution requires detach=False."
+            raise ValueError(msg)
+
+        if os.name != "posix":
+            msg = "Parallel ShellJob execution requires a POSIX system."
+            raise NotImplementedError(msg)
+
+        # Validate dependencies before launching any processes.
+        ordered_steps = resolve_plan(plan)
+        commands = self._prepare_plan_commands(plan, ordered_steps)
+
+        if dry_run:
+            details = {
+                "mode": "parallel",
+                "max_workers": str(self.max_workers),
+            }
+            if self.cwd is not None:
+                details["cwd"] = str(self.cwd)
+
+            return JobDryRun(
+                command="\n".join(
+                    f"{step}: {shlex.join(commands[step])}" for step in ordered_steps
+                ),
+                details=details,
+            )
+
+        pending = commands.copy()
+        running: dict[str, subprocess.Popen[bytes]] = {}
+        completed: dict[str, JobHandle] = {}
+
+        # Python signal handlers can only be installed by the main thread.
+        handle_sigterm = current_thread() is main_thread()
+        if handle_sigterm:
+            previous_sigterm = signal.signal(signal.SIGTERM, _exit_on_sigterm)
+
+        try:
+            while pending or running:
+                self._advance_plan(plan, pending, running, completed)
+        except BaseException:
+            _stop_process_groups(running)
+            raise
+        finally:
+            if handle_sigterm:
+                signal.signal(signal.SIGTERM, previous_sigterm)
+
+        return {step: completed[step] for step in ordered_steps}
+
+    def _prepare_plan_commands(
+        self,
+        plan: ProcessPlan,
+        ordered_steps: list[str],
+    ) -> dict[str, list[str]]:
+        """Resolve and validate commands before execution.
+
+        Args:
+            plan: Process steps containing commands and dependencies.
+            ordered_steps: Process step names in dependency order.
+
+        Returns:
+            Commands keyed by process step name.
+
+        Raises:
+            FileNotFoundError: If the flepimop2 executable is not found.
+            ValueError: If a planned command is invalid.
+        """
+        if self._exe is None:
+            self._exe = shutil.which("flepimop2")
+
+        if self._exe is None:
+            msg = "Could not locate the 'flepimop2' executable on PATH."
+            raise FileNotFoundError(msg)
+
+        commands: dict[str, list[str]] = {}
+
+        for step in ordered_steps:
+            argv = plan[step]["command"]
+
+            if len(argv) < 2 or argv[0] != "flepimop2":
+                msg = f"Invalid flepimop2 command for step '{step}'."
+                raise ValueError(msg)
+
+            commands[step] = [self._exe, *argv[1:]]
+
+        return commands
+
+    @staticmethod
+    def _collect_completed(
+        running: dict[str, subprocess.Popen[bytes]],
+        completed: dict[str, JobHandle],
+    ) -> bool:
+        """Collect completed subprocesses and detect execution failures.
+
+        Args:
+            running: Currently running subprocesses keyed by step name.
+            completed: Successfully completed job handles.
+
+        Returns:
+            True if at least one subprocess completed, otherwise False.
+
+        Raises:
+            RuntimeError: If a subprocess exits with a nonzero return code.
+        """
+        progressed = False
+
+        for step, proc in list(running.items()):
+            returncode = proc.poll()
+
+            if returncode is None:
+                continue
+
+            if returncode != 0:
+                msg = f"Process step '{step}' failed with exit code {returncode}."
+                raise RuntimeError(msg)
+
+            completed[step] = JobHandle(
+                job_id=str(proc.pid),
+                backend="shell",
+                metadata={
+                    "mode": "blocking",
+                    "returncode": returncode,
+                    "step": step,
+                },
+            )
+
+            del running[step]
+            progressed = True
+
+        return progressed
+
+    def _launch_ready(
+        self,
+        plan: ProcessPlan,
+        pending: dict[str, list[str]],
+        running: dict[str, subprocess.Popen[bytes]],
+        completed: dict[str, JobHandle],
+    ) -> bool:
+        """Launch process steps whose dependencies have completed.
+
+        Args:
+            plan: Process steps and their dependencies.
+            pending: Commands waiting to execute.
+            running: Currently running subprocesses.
+            completed: Successfully completed job handles.
+
+        Returns:
+            True if at least one subprocess was launched, otherwise False.
+        """
+        launched = False
+
+        for step, argv in list(pending.items()):
+            if len(running) >= self.max_workers:
+                break
+
+            if not all(dep in completed for dep in plan[step]["depends"]):
+                continue
+
+            proc = subprocess.Popen(  # noqa: S603
+                argv,
+                cwd=self.cwd,
+                env=self.env,
+                start_new_session=True,
+            )
+
+            running[step] = proc
+            del pending[step]
+            launched = True
+
+        return launched
+
+    def _advance_plan(
+        self,
+        plan: ProcessPlan,
+        pending: dict[str, list[str]],
+        running: dict[str, subprocess.Popen[bytes]],
+        completed: dict[str, JobHandle],
+    ) -> None:
+        """Advance execution by collecting results and launching ready steps.
+
+        Args:
+            plan: Process steps and their dependencies.
+            pending: Commands waiting to execute.
+            running: Currently running subprocesses.
+            completed: Successfully completed job handles.
+
+        Raises:
+            RuntimeError: If remaining process steps cannot progress.
+        """
+        progressed = self._collect_completed(running, completed)
+
+        progressed = self._launch_ready(plan, pending, running, completed) or progressed
+
+        if pending and not running:
+            msg = f"Process plan cannot progress. Remaining steps: {sorted(pending)}"
+            raise RuntimeError(msg)
+
+        if running and not progressed:
+            sleep(0.05)
+
     def _status(self, handle: JobHandle) -> JobStatusResult:  # noqa: PLR6301
         """Report the status of a previously submitted shell job.
 
@@ -172,3 +431,34 @@ class ShellJob(JobABC, module="shell"):
             status=status,
             detail=detail,
         )
+
+
+def _exit_on_sigterm(signum: int, _frame: "FrameType | None") -> None:
+    """Unwind plan execution while allowing process-group cleanup to finish.
+
+    Raises:
+        SystemExit: With the conventional exit status for signal cancellation.
+    """
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise SystemExit(128 + signum)
+
+
+def _stop_process_groups(
+    running: dict[str, subprocess.Popen[bytes]],
+) -> None:
+    """Terminate and reap running subprocesses with bounded waits."""
+    processes = list(running.values())
+
+    for sig, timeout in (
+        (signal.SIGTERM, 3.0),
+        (signal.SIGKILL, 1.0),
+    ):
+        for proc in processes:
+            with suppress(ProcessLookupError):
+                os.killpg(proc.pid, sig)
+
+        deadline = monotonic() + timeout
+
+        for proc in processes:
+            with suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=max(0.0, deadline - monotonic()))
